@@ -1689,6 +1689,7 @@
                                 appState.inventory[cat].forEach(item => {
                                     if (item.minStockLevel === undefined) item.minStockLevel = 0;
                                     if (item.notes === undefined) item.notes = [];
+                                    if (!item.openingStockDate) item.openingStockDate = '2020-01-01'; // Migration Fix for missing dates
                                 });
                             }
                         });
@@ -9282,27 +9283,61 @@
                 });
             });
 
-            // 3. Production Add (Finished Good)
+            // 3. Production Entry (Finished Goods)
             const formula = appState.formulas.find(f => f.id == batch.formulaId);
-            if (formula) {
-                const fgItem = appState.inventory.finishedGoods.find(i => i.name === formula.name);
-                if (fgItem) {
-                    appState.transactions.push({
-                        id: Date.now() + Math.random(),
-                        itemId: fgItem.id,
-                        category: 'finishedGoods',
-                        type: 'production-add',
-                        quantity: actualProduceQty,
-                        date: date,
-                        batchNo: batchNo,
-                        mfgDate: date,
-                        expiryDate: expiryDate
-                    });
-                } else {
-                    showAlert("Warning: FG Item not found for " + formula.name);
-                }
+
+            // AUTO-CREATE FINISHED GOOD IF MISSING
+            // Logic: Check if batch.itemId maps to an existing item. If not, check by name.
+            let fgItem = findItem('finishedGoods', batch.itemId);
+            if (!fgItem) {
+                // Try by name
+                fgItem = appState.inventory.finishedGoods.find(i => i.name === (batch.itemName || (formula ? formula.name : '')));
             }
 
+            if (!fgItem && formula) {
+                // CREATE NEW FINISHED GOOD
+                fgItem = {
+                    id: Date.now() + Math.random(), // Unique ID
+                    name: formula.name,
+                    unit: formula.outputUnit || 'Units',
+                    price: 0, // Should be calculated but 0 for now
+                    quantity: 0, // Base stock
+                    category: 'Finished Goods',
+                    minStock: 0,
+                    location: 'Warehouse',
+                    expiryDays: 0,
+                    closingStock: 0 // Will add to this
+                };
+                if (!appState.inventory.finishedGoods) appState.inventory.finishedGoods = [];
+                appState.inventory.finishedGoods.push(fgItem);
+
+                // Update batch linkage for history
+                batch.itemId = fgItem.id;
+                if (!batch.itemName) batch.itemName = fgItem.name;
+
+                console.log("Auto-created New Finished Good:", fgItem);
+            }
+
+            if (fgItem) {
+                // Add Transaction
+                appState.transactions.push({
+                    id: Date.now() + Math.random(),
+                    itemId: fgItem.id,
+                    category: 'finishedGoods',
+                    type: 'production-in',
+                    quantity: actualProduceQty,
+                    date: date,
+                    expiryDate: expiryDate,
+                    batchNo: batch.batchNumber || batch.batchNo,
+                    notes: `Production Completed (Batch: ${batch.batchNumber || batch.batchNo})`
+                });
+
+                // Update Stock logic is handled by recalculateStock() globally or we can do it here optimistically
+                // But usually we rely on recalculate
+            } else {
+                // Fallback if no formula and no item (shouldn't happen with new logic)
+                console.warn("Could not find or create FG item for batch", batch);
+            }
             // 4. Close & Cleanup
             appState.activeProduction = (appState.activeProduction || []).filter(b => b.id != currentCompletingBatchId);
             appState.productionQueue = (appState.productionQueue || []).filter(b => b.id != currentCompletingBatchId);
@@ -10241,116 +10276,8 @@
 
         // 2. PRODUCTION VIEW BOM MANAGEMENT
 
-        window.renderProductionWIPView = function () {
-            const container = document.getElementById('production-wip-view');
+        // REMOVED LEGACY RENDER FUNCTION - SEE NEW IMPLEMENTATION BELOW AROUND LINE 21441
 
-            const activeBatches = appState.activeProduction || [];
-            activeBatches.sort((a, b) => new Date(b.startDate) - new Date(a.startDate)); // Desc
-
-            const formulas = appState.formulas || [];
-
-            container.innerHTML = `
-                <div class="p-6">
-                     <div class="flex justify-between items-center mb-6">
-                        <h2 class="text-2xl font-bold text-gray-800">Orders & Production (WIP)</h2>
-                        <button onclick="exportProductionHistory()" class="px-4 py-2 bg-green-600 text-white rounded shadow hover:bg-green-700 font-bold flex items-center">
-                            <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
-                            Download History
-                        </button>
-                     </div>
-                     
-                     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-                        <!-- Left: Create New Batch -->
-                        <div class="bg-white p-6 rounded-lg shadow h-fit">
-                            <h3 class="text-xl font-bold mb-4 text-blue-600">Start New Production</h3>
-                            <form id="create-batch-form" onsubmit="handleCreateBatch(event)">
-                                <div class="mb-4">
-                                    <label class="block text-sm font-medium mb-1">Batch ID / Order Ref</label>
-                                    <input type="text" id="new-batch-id" class="w-full p-2 border rounded font-mono" placeholder="e.g. B-2023-001" required>
-                                </div>
-                                <div class="mb-4">
-                                    <label class="block text-sm font-medium mb-1">Product Formula</label>
-                                    <select id="new-batch-formula" class="w-full p-2 border rounded" required>
-                                        <option value="">-- Select Product --</option>
-                                        ${formulas.map(f => `<option value="${f.id}">${f.name} (${f.outputQty} ${f.outputUnit})</option>`).join('')}
-                                    </select>
-                                </div>
-                                <div class="mb-4">
-                                    <label class="block text-sm font-medium mb-1">Target Quantity</label>
-                                    <input type="number" id="new-batch-qty" step="any" class="w-full p-2 border rounded" placeholder="Qty to produce" required>
-                                </div>
-                                <button type="submit" class="w-full py-2 bg-blue-600 text-white rounded font-bold hover:bg-blue-700">Create Order</button>
-                            </form>
-                        </div>
-
-                        <!-- Right: Active Batches List -->
-                        <div class="lg:col-span-2 space-y-4">
-                            ${activeBatches.length === 0 ? '<div class="bg-white p-8 rounded-lg shadow text-center text-gray-500">No active production orders.</div>' :
-                    activeBatches.map(batch => {
-                        const formula = formulas.find(f => f.id == batch.formulaId);
-                        const formulaName = formula ? formula.name : 'Unknown Product';
-
-                        // Count items
-                        let reservedCount = 0;
-                        if (batch.reservedData) {
-                            reservedCount += (batch.reservedData.rawMaterials?.length || 0);
-                            reservedCount += (batch.reservedData.packingMaterials?.length || 0);
-                            reservedCount += (batch.reservedData.labels?.length || 0);
-                        }
-
-                        return `
-                                <div class="bg-white p-6 rounded-lg shadow border-l-4 ${batch.status === 'started' ? 'border-blue-500' : 'border-gray-300'}">
-                                    <div class="flex justify-between items-start mb-4">
-                                        <div>
-                                            <h4 class="text-lg font-bold text-gray-800">${formulaName}</h4>
-                                            <p class="text-sm text-gray-500 font-mono">Batch: ${batch.batchNo}</p>
-                                        </div>
-                                        <div class="text-right">
-                                            <span class="px-3 py-1 rounded-full text-xs font-bold uppercase tracking-wide ${batch.status === 'started' ? 'bg-blue-100 text-blue-800' : 'bg-gray-100'}">${batch.status}</span>
-                                        </div>
-                                    </div>
-                                    
-                                    <div class="grid grid-cols-3 gap-4 text-sm mb-4 bg-gray-50 p-3 rounded">
-                                        <div><p class="text-gray-500 text-xs uppercase">Target Qty</p><p class="font-bold text-lg">${batch.targetQty}</p></div>
-                                        <div><p class="text-gray-500 text-xs uppercase">Start Date</p><p class="font-bold">${new Date(batch.startDate).toLocaleDateString()}</p></div>
-                                        <div><p class="text-gray-500 text-xs uppercase">Reserved Items</p><p class="font-bold text-blue-600">${reservedCount} Items</p></div>
-                                    </div>
-                                    
-                                    ${batch.shortageOverride ? '<p class="text-xs text-red-600 font-bold mb-2">⚠️ Started with Shortage Override</p>' : ''}
-
-                                    <div class="flex flex-wrap gap-2 border-t pt-4">
-                                        ${batch.status === 'draft' ?
-                                `<button onclick="startBatch(${batch.id})" class="px-3 py-1 bg-green-600 text-white rounded text-sm font-bold hover:bg-green-700">Start (Reserve)</button>
-                                             <button onclick="deleteBatch(${batch.id})" class="px-3 py-1 bg-red-100 text-red-600 rounded text-sm font-bold hover:bg-red-200">Delete</button>`
-                                : ''}
-                                        
-                                        ${batch.status === 'started' ?
-                                `<button onclick="completeBatch(${batch.id})" class="px-3 py-1 bg-indigo-600 text-white rounded text-sm font-bold hover:bg-indigo-700">Complete</button>
-                                             <button onclick="openBatchBOMModal(${batch.id})" class="px-3 py-1 bg-purple-600 text-white rounded text-sm font-bold hover:bg-purple-700 flex items-center gap-1">
-                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>
-                                                Reserved
-                                             </button>
-                                             <button onclick="openConsumptionSlipModal(${batch.id})" class="px-3 py-1 bg-blue-600 text-white rounded text-sm font-bold hover:bg-blue-700 flex items-center gap-1">
-                                                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
-                                                Log Slip
-                                             </button>
-                                             <button onclick="openPauseModal(${batch.id})" class="px-3 py-1 bg-yellow-500 text-white rounded text-sm font-bold hover:bg-yellow-600">Pause</button>
-                                             <button onclick="cancelBatch(${batch.id})" class="px-3 py-1 bg-red-100 text-red-600 rounded text-sm font-bold hover:bg-red-200">Cancel</button>`
-                                : ''}
-                                        
-                                        ${batch.status === 'paused' ?
-                                `<button onclick="resumeProduction(${batch.id})" class="px-3 py-1 bg-green-500 text-white rounded text-sm font-bold hover:bg-green-600">Resume</button>
-                                             <button onclick="openConsumptionSlipModal(${batch.id})" class="px-3 py-1 bg-blue-600 text-white rounded text-sm font-bold hover:bg-blue-700">Log Slip</button>`
-                                : ''}
-                                    </div>
-                                </div>
-                                `;
-                    }).join('')}
-                        </div>
-                     </div>
-                </div>
-            `;
-        };
 
         window.openBatchBOMModal = function (batchId) {
             const batch = appState.activeProduction.find(b => b.id == batchId);
@@ -21354,13 +21281,17 @@
             batch.status = 'Completed';
             batch.completedDate = today;
 
+            // 5. UPDATE SLIP STATUS TO COMPLETED IF LINKED
+            if (batch.productionSlipId && window.markSlipAsUsed) {
+                window.markSlipAsUsed(batch.productionSlipId, batch.batchNumber, 'Completed');
+            }
+
             saveState();
             renderProductionWIPView();
-
-            if (window.showToast) showToast("Batch Completed & Stock Updated");
+            if (window.showToast) showToast('Production Completed Successfully');
         };
 
-        window.markSlipAsUsed = function (slipId, batchNo) {
+        window.markSlipAsUsed = function (slipId, batchNo, status) {
             const url = localStorage.getItem('GAS_URL');
             if (url) {
                 const finalUrl = `${url}?action=mark_used&id=${encodeURIComponent(slipId)}&context=${encodeURIComponent(batchNo)}`;
@@ -21505,10 +21436,10 @@
                     </div>
 
                     <div>
-                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Product Formula</label>
+                        <label class="block text-xs font-bold text-gray-500 uppercase mb-1">Product Formula <span class="text-gray-400 font-normal">(${appState.formulas.length})</span></label>
                         <select id="np-product" class="w-full p-3 border rounded-lg bg-gray-50 focus:bg-white transition-colors outline-none cursor-pointer">
                             <option value="">-- Select Product --</option>
-                            ${appState.inventory.finishedGoods.map(i => `<option value="${i.name}">${i.name}</option>`).join('')}
+                            ${appState.formulas.map(f => `<option value="${f.id}">${f.name} (${f.outputQty} ${f.outputUnit})</option>`).join('')}
                         </select>
                     </div>
 
@@ -21522,13 +21453,16 @@
                         <input type="number" id="np-qty" class="w-full p-3 border rounded-lg text-gray-700 outline-none" placeholder="Qty to produce">
                     </div>
 
-                    <div id="np-auth-display" class="hidden p-2 bg-green-50 text-green-700 text-xs rounded border border-green-200 mt-2 font-bold">
-                        Authorized By: <span id="np-auth-name"></span>
+                    <div id="np-auth-display" class="hidden p-3 bg-green-50 text-green-700 text-xs rounded border border-green-200 mt-2 font-bold flex justify-between items-center">
+                        <span>Authorized By: <span id="np-auth-name"></span></span>
                     </div>
 
-                    <button onclick="createOrder()" class="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-md transition-transform active:scale-95 mt-4">
-                        Create Order
-                    </button>
+                    <div class="mt-4 pt-2 border-t border-dashed border-gray-200">
+                        <button onclick="createOrder()" type="button" class="w-full py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold rounded-lg shadow-lg hover:shadow-xl transition-all active:scale-95 flex justify-center items-center gap-2">
+                             <span>Create Order</span>
+                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        </button>
+                    </div>
                 </div>
             </div>
 
@@ -21572,7 +21506,14 @@
                             <div class="p-4 flex justify-between items-start bg-gray-50 border-b">
                                 <div>
                                     <div class="flex items-center gap-2">
-                                         <h4 class="font-bold text-lg text-gray-800">${batch.itemName || batch.product || batch.name || 'Unknown Item'}</h4>
+                                         <h4 class="font-bold text-lg text-gray-800">${(function () {
+                                if (batch.itemName) return batch.itemName;
+                                if (batch.formulaId) {
+                                    const f = appState.formulas.find(x => x.id == batch.formulaId);
+                                    if (f) return f.name;
+                                }
+                                return batch.product || batch.name || 'Unknown Item';
+                            })()}</h4>
                                          <span class="px-2 py-0.5 rounded-full text-xs font-bold bg-${statusColor}-100 text-${statusColor}-700 border border-${statusColor}-200">${batch.status || 'In Progress'}</span>
                                     </div>
                                     <div class="flex items-center gap-2 text-xs text-gray-400 mt-1">
@@ -21585,6 +21526,7 @@
                                      <!-- Status Indicator -->
                                 </div>
                             </div>
+
 
                             <!-- Metrics -->
                             <div class="p-4 grid grid-cols-3 gap-4 text-center border-b border-gray-50">
@@ -21821,27 +21763,93 @@
                 }
             }
 
-            // If still missing, check if "Unknown Product" needs handling, but alerting user is better if we really can't find it.
+            // If still missing, AUTO-CREATE THE ITEM
+            if (!fgItem) {
+                const newName = batch.itemName || (formula ? formula.name : 'Unknown Product');
+                const newUnit = batch.unit || (formula ? formula.outputUnit : 'Unit');
+
+                // Create new FG Item
+                fgItem = {
+                    id: Date.now() + Math.floor(Math.random() * 1000),
+                    name: newName,
+                    unit: newUnit,
+                    category: 'finishedGoods',
+                    openingStock: 0,
+                    openingStockDate: getToday(), // CRITICAL for calculateStock
+                    price: 0,
+                    minStockLevel: 0,
+                    location: 'Default'
+                };
+
+                if (!appState.inventory.finishedGoods) appState.inventory.finishedGoods = [];
+                appState.inventory.finishedGoods.push(fgItem);
+
+                if (window.showToast) showToast(`Created new item: ${newName}`);
+                console.log("Auto-created FG Item:", fgItem);
+            }
 
             if (fgItem) {
+                // Update Stock
+                // We don't hold stock on the item object directly in V4, we calculate from transactions.
+                // But for display consistency or if hybrid model:
+                // fgItem.closingStock = (fgItem.closingStock || 0) + actualProduceQty; 
+
                 appState.transactions.push({
                     id: Date.now() + Math.random(),
                     itemId: fgItem.id,
                     category: 'finishedGoods',
-                    type: 'production-add',
+                    type: 'production-add', // This adds to stock
                     quantity: actualProduceQty,
                     date: date,
                     batchNo: batch.batchNumber || batch.batchNo,
                     mfgDate: date,
-                    expiryDate: expiryDate
+                    expiryDate: expiryDate,
+                    notes: `Produced via Batch ${batch.batchNumber || batch.batchNo}`
                 });
             } else {
-                console.warn("Warning: FG Item not found for " + (formula ? formula.name : 'Unknown'));
+                console.warn("Critical Error: Could not create FG Item.");
+                alert("Error: Could not update Finished Goods stock. Please check item settings.");
             }
 
             // 3.5 CLOSE MARK USED ON BACKEND (Sync with Requisition App)
+            // 3.5 CLOSE MARK USED ON BACKEND (Sync with Requisition App)
             if (batch.productionSlipId && window.markSlipAsUsed) {
-                window.markSlipAsUsed(batch.productionSlipId, batch.batchNumber || batch.batchNo);
+                // Prepare Consumed Items List
+                const consumptionList = [];
+                // Helper to resolve name
+                const getName = (id, cat) => {
+                    const i = (appState.inventory[cat] || []).find(x => x.id == id);
+                    return i ? i.name : 'Unknown Item';
+                };
+                const getUnit = (id, cat) => {
+                    const i = (appState.inventory[cat] || []).find(x => x.id == id);
+                    return i ? i.unit : '';
+                };
+
+                // Scan actualConsumptions (Flat Array: {cat, itemId, qty, waste})
+                if (actualConsumptions && Array.isArray(actualConsumptions)) {
+                    actualConsumptions.forEach(c => {
+                        if (parseFloat(c.qty) > 0) {
+                            consumptionList.push({
+                                itemName: getName(c.itemId, c.cat),
+                                qty: parseFloat(c.qty),
+                                unit: getUnit(c.itemId, c.cat),
+                                category: c.cat,
+                                notes: c.waste > 0 ? `Consumed (Waste: ${c.waste})` : 'Consumed'
+                            });
+                        }
+                    });
+                }
+
+                window.markSlipAsUsed(
+                    batch.productionSlipId,
+                    batch.batchNumber || batch.batchNo,
+                    'Completed',
+                    fgItem ? fgItem.name : (batch.itemName || 'Batch Completed'),
+                    actualProduceQty,
+                    fgItem ? fgItem.unit : (batch.unit || 'Unit'),
+                    consumptionList // Pass extra items
+                );
             }
 
             // 4. Archive to Production History
@@ -21859,7 +21867,16 @@
             saveState();
             closeModal('completeBatchModal');
             renderProductionWIPView();
-            showAlert(`Batch ${batch.batchNumber || batch.batchNo} Completed!\nProduced: ${actualProduceQty}\nStock Consumed, Reservation Released & FG Added.`);
+
+            // ALERT FIX: Use native alert or specific success modal if showAlert is ambiguous
+            // The user reported "Confirm Delete" appearing. This implies showAlert reuses that modal.
+            // Let's force a simple alert or toast for now to avoid the confusion.
+            // showAlert(`Batch ...`) -> changed to native alert or showToast
+            if (window.showToast) {
+                showToast(`Batch ${batch.batchNumber || batch.batchNo} Completed!`);
+            } else {
+                alert(`Batch ${batch.batchNumber || batch.batchNo} Completed!\nProduced: ${actualProduceQty}`);
+            }
 
             currentCompletingBatchId = null;
         };
@@ -21929,6 +21946,10 @@
 
                     sel.innerHTML = '<option value="">-- Select Pending Slip --</option>';
                     appState.pendingSlips.forEach((slip, idx) => {
+                        // FILTER: Check if this slip ID is already active in production
+                        const isAlreadyActive = (appState.activeProduction || []).some(b => b.productionSlipId == slip.id && b.status !== 'cancelled');
+                        if (isAlreadyActive) return;
+
                         // Create label: "PROD-123 - Item Name" OR "PROD-123 - Employee Name"
                         let nameDisplay = (slip.itemName && slip.itemName !== 'Unknown') ? slip.itemName : (slip.employee || 'Unknown');
 
@@ -22012,39 +22033,45 @@
 
         window.createOrder = function () {
             const batchNo = document.getElementById('np-batch').value;
-            const prod = document.getElementById('np-product').value;
+            const formulaId = document.getElementById('np-product').value;
             const date = document.getElementById('np-date').value;
             const qty = document.getElementById('np-qty').value;
             // NEW:
             const slipId = document.getElementById('np-slip-id').value;
             const authName = document.getElementById('np-auth-name').textContent;
 
-            if (!batchNo || !prod || !qty) { alert("Please fill all fields."); return; }
+            if (!batchNo || !formulaId || !qty) { alert("Please fill all fields."); return; }
 
-            const item = appState.inventory.finishedGoods.find(i => i.name === prod);
+            // Find Formula
+            const formula = appState.formulas.find(f => f.id == formulaId);
+            if (!formula) { alert("Invalid Formula Selected"); return; }
+            const prodName = formula.name;
+
+            // Find Linked Finished Good (if any)
+            const item = appState.inventory.finishedGoods.find(i => i.name === prodName);
 
             const newBatch = {
                 id: Date.now(), // ESSENTIAL
                 batchNumber: batchNo,
-                itemName: prod,
-                itemId: item ? item.id : Date.now(),
+                itemName: prodName,
+                itemId: item ? item.id : null, // If null, will be auto-created on completion
+                formulaId: formulaId,
                 targetQty: qty,
-                unit: item ? item.unit : 'Units',
+                unit: item ? item.unit : formula.outputUnit,
                 startDate: date || new Date().toISOString(),
                 status: 'In Progress',
                 productionSlipId: slipId || null, // USE HIDDEN ID
                 slipEmployee: slipId ? authName : null, // Store Auth Name mainly
-                isReserved: false
+                isReserved: true // Always reserved if formula exists
             };
 
             // NEW: Link Formula & Calculate Reservations
             // DEBUG: Alert to show what we are looking for
-            // console.log("Searching for formula matching:", prod);
-
-            const formula = appState.formulas.find(f => f.name === prod || f.productName === prod);
+            // console.log("Searching for formula matching:", prodName);
+            // const formula = ... (already found above)
 
             if (formula) {
-                newBatch.formulaId = formula.id;
+                // formulaId already set
                 newBatch.isReserved = true;
 
                 // Calculate Requirements - ROBUST METHOD FROM BACKUP
@@ -22086,16 +22113,68 @@
             document.getElementById('np-auth-display').classList.add('hidden'); // Hide auth
 
             if (window.showToast) showToast("Order Created with Slip Linked");
+
+            // NEW: Mark Slip as Used Immediately (Backend Sync) - IN PROGRESS
+            if (slipId && window.markSlipAsUsed) {
+                window.markSlipAsUsed(slipId, newBatch.batchNumber, 'In Progress', newBatch.itemName, newBatch.targetQty, newBatch.unit);
+
+                // Also remove locally to update UI immediately without re-fetch
+                if (appState.pendingSlips) {
+                    appState.pendingSlips = appState.pendingSlips.filter(s => s.id != slipId);
+                    // Update Dropdown UI
+                    const sel = document.getElementById('np-pending-slip');
+                    if (sel) {
+                        for (let i = 0; i < sel.options.length; i++) {
+                            if (sel.options[i].text.includes(slipId)) {
+                                sel.remove(i);
+                                break;
+                            }
+                        }
+                        sel.value = ""; // Reset selection
+                    }
+                }
+            }
         };
 
         // [DELETED] Legacy duplicates of togglePauseBatch, toggleReserved, cancelBatch, completeBatchProduction
         // These were conflicting with the updated logic at the top of the file.
 
-        window.markSlipAsUsed = function (slipId, batchNo) {
+        window.markSlipAsUsed = function (slipId, batchNo, statusLabel = 'Processed', itemName = '', qty = 0, unit = '', extraItems = []) {
             const url = localStorage.getItem('GAS_URL');
             if (url) {
-                const finalUrl = `${url}?action=mark_used&id=${encodeURIComponent(slipId)}&context=${encodeURIComponent(batchNo)}`;
-                fetch(finalUrl).then(r => r.json()).then(d => console.log("Slip Marked:", d)).catch(e => console.error(e));
+                // Main Finished Good Item
+                const mainItem = {
+                    itemName: itemName || 'Production Batch',
+                    qty: qty || 0,
+                    unit: unit || '',
+                    category: 'finishedGoods',
+                    notes: `Batch: ${batchNo} [${statusLabel}]`
+                };
+
+                // Combine with Extra Consumed Items
+                // Ensure extraItems is an array
+                const allItems = [mainItem, ...(Array.isArray(extraItems) ? extraItems : [])];
+                const itemsPayload = JSON.stringify(allItems);
+
+                // Use POST to avoid URL length limits and encoding issues
+                const formData = new URLSearchParams();
+                formData.append('action', 'mark_used');
+                formData.append('id', slipId);
+                formData.append('context', batchNo);
+                formData.append('status', statusLabel);
+                formData.append('items', itemsPayload);
+
+                fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: formData
+                })
+                    .then(r => r.json())
+                    .then(d => {
+                        console.log(`Slip Marked ${statusLabel} with Item Details:`, d);
+                        // Optional: Show toast if it was a manual action, but here it's auto
+                    })
+                    .catch(e => console.error("Failed to mark slip used:", e));
             }
         };
 
